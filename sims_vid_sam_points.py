@@ -101,6 +101,34 @@ def autocast_context(device: str):
     return nullcontext()
 
 
+def propagate_window(predictor, frames: list[np.ndarray], boxes: list[list[int] | None], start: int, end: int, device: str) -> dict[int, np.ndarray]:
+    prompt_offset = next((idx for idx in range(start, end) if boxes[idx] is not None), None)
+    if prompt_offset is None:
+        return {}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        frame_dir = Path(tmpdir)
+        for idx in range(start, end):
+            cv2.imwrite(str(frame_dir / f"{idx - start:05d}.jpg"), frames[idx])
+
+        with torch.inference_mode(), autocast_context(device):
+            state = predictor.init_state(video_path=str(frame_dir))
+            predictor.add_new_points_or_box(
+                inference_state=state,
+                frame_idx=prompt_offset - start,
+                obj_id=1,
+                box=np.array(boxes[prompt_offset], dtype=np.float32),
+            )
+
+            masks_by_frame: dict[int, np.ndarray] = {}
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(state):
+                mask_idx = list(out_obj_ids).index(1)
+                masks_by_frame[start + out_frame_idx] = (out_mask_logits[mask_idx] > 0.0).cpu().numpy().squeeze()
+
+    print(f"prompted SAM2 on frames {start}-{end - 1} at frame {prompt_offset} with box {boxes[prompt_offset]}")
+    return masks_by_frame
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--video", type=Path, default=Path("assets/chase.mp4"))
@@ -112,10 +140,13 @@ def main() -> None:
     parser.add_argument("--min-area", type=int, default=20)
     parser.add_argument("--pad", type=int, default=2)
     parser.add_argument("--frames", type=int, default=None)
+    parser.add_argument("--window", type=int, default=60)
     parser.add_argument("--device", default=None)
     parser.add_argument("--sam2-cfg", default="configs/sam2.1/sam2.1_hiera_t.yaml")
     parser.add_argument("--sam2-checkpoint", type=Path, default=Path("checkpoints/sam2.1_hiera_tiny.pt"))
     args = parser.parse_args()
+    if args.window <= 0:
+        raise ValueError("--window must be positive")
 
     device = args.device
     if device is None:
@@ -196,8 +227,7 @@ def main() -> None:
     finally:
         cap.release()
 
-    prompt_frame_idx = next((idx for idx, box in enumerate(boxes) if box is not None), None)
-    if prompt_frame_idx is None:
+    if not any(box is not None for box in boxes):
         raise RuntimeError("No valid box prompt found")
 
     with args.boxes_out.open("w") as boxes_file:
@@ -217,44 +247,29 @@ def main() -> None:
         raise RuntimeError(f"Could not open video writer: {args.out}")
 
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            frame_dir = Path(tmpdir)
+        masks_by_frame: dict[int, np.ndarray] = {}
+        for start in range(0, len(frames), args.window):
+            end = min(start + args.window, len(frames))
+            masks_by_frame.update(propagate_window(predictor, frames, boxes, start, end, device))
+
+        with args.masks_out.open("w") as masks_file:
             for idx, frame_bgr in enumerate(frames):
-                cv2.imwrite(str(frame_dir / f"{idx:05d}.jpg"), frame_bgr)
-
-            with torch.inference_mode(), autocast_context(device):
-                state = predictor.init_state(video_path=str(frame_dir))
-                predictor.add_new_points_or_box(
-                    inference_state=state,
-                    frame_idx=prompt_frame_idx,
-                    obj_id=1,
-                    box=np.array(boxes[prompt_frame_idx], dtype=np.float32),
-                )
-
-                masks_by_frame: dict[int, np.ndarray] = {}
-                for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(state):
-                    mask_idx = list(out_obj_ids).index(1)
-                    masks_by_frame[out_frame_idx] = (out_mask_logits[mask_idx] > 0.0).cpu().numpy().squeeze()
-
-            with args.masks_out.open("w") as masks_file:
-                for idx, frame_bgr in enumerate(frames):
-                    frame_out = frame_bgr.copy()
-                    if idx in masks_by_frame:
-                        mask = masks_by_frame[idx]
-                        frame_out = overlay_mask(frame_out, mask)
-                        ys, xs = np.where(mask)
-                        mask_box = None
-                        if xs.size and ys.size:
-                            mask_box = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
-                            cv2.rectangle(frame_out, (mask_box[0], mask_box[1]), (mask_box[2], mask_box[3]), (0, 255, 0), 2)
-                        masks_file.write(json.dumps({"frame_index": idx, "mask_box": mask_box}) + "\n")
-                    else:
-                        masks_file.write(json.dumps({"frame_index": idx, "mask_box": None}) + "\n")
-                    writer.write(frame_out)
+                frame_out = frame_bgr.copy()
+                if idx in masks_by_frame:
+                    mask = masks_by_frame[idx]
+                    frame_out = overlay_mask(frame_out, mask)
+                    ys, xs = np.where(mask)
+                    mask_box = None
+                    if xs.size and ys.size:
+                        mask_box = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+                        cv2.rectangle(frame_out, (mask_box[0], mask_box[1]), (mask_box[2], mask_box[3]), (0, 255, 0), 2)
+                    masks_file.write(json.dumps({"frame_index": idx, "mask_box": mask_box}) + "\n")
+                else:
+                    masks_file.write(json.dumps({"frame_index": idx, "mask_box": None}) + "\n")
+                writer.write(frame_out)
     finally:
         writer.release()
 
-    print(f"prompted SAM2 on frame {prompt_frame_idx} with box {boxes[prompt_frame_idx]}")
     print(f"wrote {args.out}")
     print(f"wrote {args.boxes_out}")
     print(f"wrote {args.masks_out}")

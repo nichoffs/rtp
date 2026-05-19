@@ -71,28 +71,87 @@ def shift_box_up(box: list[int] | None, pixels: int) -> list[int] | None:
     return [x1, y1 - shift, x2, y2 - shift]
 
 
-def shrink_box(box: list[int] | None, pixels: int) -> list[int] | None:
-    if box is None:
-        return None
+def box_to_measurement(box: list[int]) -> np.ndarray:
     x1, y1, x2, y2 = box
-    x1 += pixels
-    y1 += pixels
-    x2 -= pixels
-    y2 -= pixels
-    if x1 > x2 or y1 > y2:
+    w = x2 - x1 + 1
+    h = y2 - y1 + 1
+    return np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0, w, h], dtype=np.float32)
+
+
+def measurement_to_box(measurement: np.ndarray, width: int, height: int) -> list[int] | None:
+    cx, cy, w, h = measurement[:4]
+    if w <= 1 or h <= 1:
+        return None
+
+    x1 = int(round(cx - w / 2.0))
+    y1 = int(round(cy - h / 2.0))
+    x2 = int(round(cx + w / 2.0))
+    y2 = int(round(cy + h / 2.0))
+
+    x1 = min(max(x1, 0), width - 1)
+    y1 = min(max(y1, 0), height - 1)
+    x2 = min(max(x2, 0), width - 1)
+    y2 = min(max(y2, 0), height - 1)
+    if x1 >= x2 or y1 >= y2:
         return None
     return [x1, y1, x2, y2]
+
+
+def make_kalman(process_noise: float, measurement_noise: float) -> cv2.KalmanFilter:
+    kf = cv2.KalmanFilter(8, 4)
+    kf.transitionMatrix = np.array(
+        [
+            [1, 0, 0, 0, 1, 0, 0, 0],
+            [0, 1, 0, 0, 0, 1, 0, 0],
+            [0, 0, 1, 0, 0, 0, 1, 0],
+            [0, 0, 0, 1, 0, 0, 0, 1],
+            [0, 0, 0, 0, 1, 0, 0, 0],
+            [0, 0, 0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 0, 0, 1],
+        ],
+        dtype=np.float32,
+    )
+    kf.measurementMatrix = np.array(
+        [
+            [1, 0, 0, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0, 0, 0],
+            [0, 0, 0, 1, 0, 0, 0, 0],
+        ],
+        dtype=np.float32,
+    )
+    kf.processNoiseCov = np.eye(8, dtype=np.float32) * process_noise
+    kf.measurementNoiseCov = np.eye(4, dtype=np.float32) * measurement_noise
+    kf.errorCovPost = np.eye(8, dtype=np.float32)
+    return kf
+
+
+def init_kalman(kf: cv2.KalmanFilter, box: list[int]) -> None:
+    measurement = box_to_measurement(box)
+    state = np.zeros((8, 1), dtype=np.float32)
+    state[:4, 0] = measurement
+    kf.statePost = state
+
+
+def draw_box(frame_bgr: np.ndarray, box: list[int] | None, color: tuple[int, int, int], thickness: int) -> None:
+    if box is None:
+        return
+    x1, y1, x2, y2 = box
+    cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, thickness)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--video", type=Path, default=Path("assets/chase.mp4"))
     parser.add_argument("--text", default="a boat")
-    parser.add_argument("--out", type=Path, default=Path("out/sims_vid_boxes.mp4"))
+    parser.add_argument("--out", type=Path, default=Path("out/sims_vid_boxes_kalman.mp4"))
     parser.add_argument("--threshold", type=float, default=0.085)
     parser.add_argument("--min-area", type=int, default=20)
     parser.add_argument("--pad", type=int, default=2)
     parser.add_argument("--frames", type=int, default=None)
+    parser.add_argument("--process-noise", type=float, default=1e-2)
+    parser.add_argument("--measurement-noise", type=float, default=10.0)
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
@@ -140,6 +199,9 @@ def main() -> None:
     with torch.inference_mode():
         text_features = encode_text_templates(adaptor, args.text, openai_imagenet_template, device)
 
+    kf = make_kalman(args.process_noise, args.measurement_noise)
+    initialized = False
+
     try:
         for idx in range(num_frames):
             ok, frame_bgr = cap.read()
@@ -160,15 +222,25 @@ def main() -> None:
             mask = (sims.float().cpu().numpy() >= args.threshold).astype(np.uint8)
             low_res_step_y = max(1, round(height / mask.shape[0]))
             mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
-            box = noisy_mask_to_box(mask, min_area=args.min_area, pad=args.pad)
-            box = shift_box_up(box, low_res_step_y)
-            box = shrink_box(box, 8)
+            raw_box = noisy_mask_to_box(mask, min_area=args.min_area, pad=args.pad)
+            raw_box = shift_box_up(raw_box, low_res_step_y)
+
+            kalman_box = None
+            if raw_box is not None and not initialized:
+                init_kalman(kf, raw_box)
+                initialized = True
+
+            if initialized:
+                prediction = kf.predict()
+                if raw_box is not None:
+                    kf.correct(box_to_measurement(raw_box).reshape(4, 1))
+                    kalman_box = measurement_to_box(kf.statePost[:4, 0], width, height)
+                else:
+                    kalman_box = measurement_to_box(prediction[:4, 0], width, height)
 
             boxed_frame = frame_bgr.copy()
-            if box is not None:
-                x1, y1, x2, y2 = box
-                cv2.rectangle(boxed_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
+            draw_box(boxed_frame, raw_box, (0, 0, 255), 1)
+            draw_box(boxed_frame, kalman_box, (0, 255, 0), 2)
             writer.write(boxed_frame)
 
             if (idx + 1) % 25 == 0 or idx + 1 == num_frames:
