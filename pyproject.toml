@@ -1,0 +1,32 @@
+[project]
+name = "rtp"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "einops",
+  "huggingface-hub",
+  "matplotlib",
+  "numpy",
+  "opencv-python-headless",
+  "pillow",
+  "safetensors",
+  "timm",
+  "torch",
+  "torchvision",
+  "transformers",
+]
+
+[project.optional-dependencies]
+sam2 = [
+  "sam2",
+]
+edgetam = [
+  "EdgeTAM @ git+https://github.com/facebookresearch/EdgeTAM.git",
+]
+all = [
+  "sam2",
+  "EdgeTAM @ git+https://github.com/facebookresearch/EdgeTAM.git",
+]
+
+[tool.uv]
+package = false
