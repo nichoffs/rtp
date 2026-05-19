@@ -1,0 +1,7 @@
+checkpoints/
+assets/
+out/
+__pycache__/
+configs/
+.DS_Store
+**.swp**
