@@ -84,15 +84,99 @@ def shrink_box(box: list[int] | None, pixels: int) -> list[int] | None:
     return [x1, y1, x2, y2]
 
 
+def iou(a: list[float], b: list[float]) -> float:
+    x1 = max(a[0], b[0])
+    y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2])
+    y2 = min(a[3], b[3])
+    inter = max(0.0, x2 - x1 + 1.0) * max(0.0, y2 - y1 + 1.0)
+    area_a = max(0.0, a[2] - a[0] + 1.0) * max(0.0, a[3] - a[1] + 1.0)
+    area_b = max(0.0, b[2] - b[0] + 1.0) * max(0.0, b[3] - b[1] + 1.0)
+    denom = area_a + area_b - inter
+    return 0.0 if denom <= 0 else inter / denom
+
+
+def center_distance_frac(a: list[float], b: list[float]) -> float:
+    acx = (a[0] + a[2]) / 2.0
+    acy = (a[1] + a[3]) / 2.0
+    bcx = (b[0] + b[2]) / 2.0
+    bcy = (b[1] + b[3]) / 2.0
+    bw = max(1.0, b[2] - b[0] + 1.0)
+    bh = max(1.0, b[3] - b[1] + 1.0)
+    return float(np.hypot((acx - bcx) / bw, (acy - bcy) / bh))
+
+
+def area_ratio(a: list[float], b: list[float]) -> float:
+    area_a = max(1.0, a[2] - a[0] + 1.0) * max(1.0, a[3] - a[1] + 1.0)
+    area_b = max(1.0, b[2] - b[0] + 1.0) * max(1.0, b[3] - b[1] + 1.0)
+    return max(area_a / area_b, area_b / area_a)
+
+
+class SingleBoxTracker:
+    def __init__(self, alpha: float, min_iou: float, max_center_dist: float, max_area_ratio: float, max_missing: int):
+        self.alpha = alpha
+        self.min_iou = min_iou
+        self.max_center_dist = max_center_dist
+        self.max_area_ratio = max_area_ratio
+        self.max_missing = max_missing
+        self.box: list[float] | None = None
+        self.missing = 0
+
+    def update(self, detection: list[int] | None) -> list[int] | None:
+        if detection is None:
+            self.missing += 1
+            return self.current_box()
+
+        det = [float(v) for v in detection]
+        if self.box is None or self.missing > self.max_missing:
+            self.box = det
+            self.missing = 0
+            return self.current_box()
+
+        match = (
+            iou(det, self.box) >= self.min_iou
+            or center_distance_frac(det, self.box) <= self.max_center_dist
+        ) and area_ratio(det, self.box) <= self.max_area_ratio
+
+        if match:
+            self.box = [
+                self.alpha * det[i] + (1.0 - self.alpha) * self.box[i]
+                for i in range(4)
+            ]
+            self.missing = 0
+        else:
+            self.missing += 1
+
+        return self.current_box()
+
+    def current_box(self) -> list[int] | None:
+        if self.box is None or self.missing > self.max_missing:
+            return None
+        return [int(round(v)) for v in self.box]
+
+
+def draw_box(frame_bgr: np.ndarray, box: list[int] | None, color: tuple[int, int, int], thickness: int) -> None:
+    if box is None:
+        return
+    x1, y1, x2, y2 = box
+    cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, thickness)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--video", type=Path, default=Path("assets/chase.mp4"))
-    parser.add_argument("--text", default="a boat")
-    parser.add_argument("--out", type=Path, default=Path("out/sims_vid_boxes.mp4"))
+    parser.add_argument("--text", default="boats")
+    parser.add_argument("--out", type=Path, default=Path("out/sims_vid_boxes_bytetrack.mp4"))
     parser.add_argument("--threshold", type=float, default=0.085)
     parser.add_argument("--min-area", type=int, default=20)
     parser.add_argument("--pad", type=int, default=2)
+    parser.add_argument("--shrink", type=int, default=0)
     parser.add_argument("--frames", type=int, default=None)
+    parser.add_argument("--alpha", type=float, default=0.45)
+    parser.add_argument("--min-iou", type=float, default=0.05)
+    parser.add_argument("--max-center-dist", type=float, default=0.8)
+    parser.add_argument("--max-area-ratio", type=float, default=4.0)
+    parser.add_argument("--max-missing", type=int, default=8)
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
@@ -140,6 +224,14 @@ def main() -> None:
     with torch.inference_mode():
         text_features = encode_text_templates(adaptor, args.text, openai_imagenet_template, device)
 
+    tracker = SingleBoxTracker(
+        alpha=args.alpha,
+        min_iou=args.min_iou,
+        max_center_dist=args.max_center_dist,
+        max_area_ratio=args.max_area_ratio,
+        max_missing=args.max_missing,
+    )
+
     try:
         for idx in range(num_frames):
             ok, frame_bgr = cap.read()
@@ -160,15 +252,14 @@ def main() -> None:
             mask = (sims.float().cpu().numpy() >= args.threshold).astype(np.uint8)
             low_res_step_y = max(1, round(height / mask.shape[0]))
             mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
-            box = noisy_mask_to_box(mask, min_area=args.min_area, pad=args.pad)
-            box = shift_box_up(box, low_res_step_y)
-            box = shrink_box(box, 8)
+            raw_box = noisy_mask_to_box(mask, min_area=args.min_area, pad=args.pad)
+            raw_box = shift_box_up(raw_box, low_res_step_y)
+            raw_box = shrink_box(raw_box, args.shrink)
+            track_box = tracker.update(raw_box)
 
             boxed_frame = frame_bgr.copy()
-            if box is not None:
-                x1, y1, x2, y2 = box
-                cv2.rectangle(boxed_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
+            draw_box(boxed_frame, raw_box, (0, 0, 255), 1)
+            draw_box(boxed_frame, track_box, (0, 255, 0), 2)
             writer.write(boxed_frame)
 
             if (idx + 1) % 25 == 0 or idx + 1 == num_frames:

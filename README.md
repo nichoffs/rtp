@@ -77,7 +77,7 @@ Run SAM2 tiny with box prompts:
 uv run python sims_vid_sam_points.py \
   --video assets/chase.mp4 \
   --text "a boat" \
-  --frames 60
+  --window 60
 ```
 
 Run EdgeTAM with box prompts:
@@ -86,11 +86,11 @@ Run EdgeTAM with box prompts:
 uv run python sims_vid_edgetam.py \
   --video assets/chase.mp4 \
   --text "a boat" \
-  --frames 60
+  --window 60
 ```
 
 ## Notes
 
 - The first RADIO run uses `torch.hub` and may download/cache NVlabs/RADIO.
-- SAM2 and EdgeTAM video predictors can slow down on long videos because they initialize and carry state over the full frame sequence. Use `--frames 60` for quick comparisons.
+- SAM2 and EdgeTAM video predictors can slow down on long videos because they initialize and carry state over a frame sequence. Use `--window 60` to process the video in 60-frame chunks.
 - `sims_vid_sam_points.py` and `sims_vid_edgetam.py` currently use the first valid RADIO-derived box as the prompt frame.

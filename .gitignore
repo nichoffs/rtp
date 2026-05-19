@@ -5,3 +5,4 @@ __pycache__/
 configs/
 .DS_Store
 **.swp**
+uv.lock
